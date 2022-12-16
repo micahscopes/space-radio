@@ -1,0 +1,18 @@
+[package]
+name = "space-radio"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace]
+members = ["xtask"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+async-osc = "0.2.0"
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", version = "0.0.0" }
+parking_lot = "0.12.1"
+
