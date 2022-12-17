@@ -1,3 +1,4 @@
+use nannou_osc as osc;
 use nih_plug::prelude::*;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ struct ArrayParams {
     /// This parameter's ID will get a `_1`, `_2`, and a `_3` suffix because of how it's used in
     /// `array_params` above.
     #[id = "channel"]
-    pub nope: FloatParam,
+    pub val: FloatParam,
 }
 
 impl Default for SpaceRadio {
@@ -33,14 +34,32 @@ impl Default for SpaceRadio {
 
 impl Default for SpaceRadioParams {
     fn default() -> Self {
+        let port = 9009;
+        let target_addr = format!("{}:{}", "127.0.0.1", port);
+
         Self {
-            array_params: (1..16).map(|index| ArrayParams {
-                nope: FloatParam::new(
-                    format!("Channel {index}"),
-                    0.0,
-                    FloatRange::Linear { min: 0.0, max: 1.0 },
-                ),
-            }).collect::<Vec<ArrayParams>>(),
+            array_params: (1..65)
+                .map(|index| {
+                    let sender = osc::sender()
+                        .expect("Could not bind to default socket")
+                        .connect(target_addr.clone())
+                        .expect("Could not connect to socket at address");
+
+                    ArrayParams {
+                        val: FloatParam::new(
+                            format!("Ch. {index}"),
+                            0.0,
+                            FloatRange::Linear { min: 0.0, max: 1.0 },
+                        )
+                        .with_callback(Arc::new(move |v| {
+                            sender.send((
+                                format!("/{}", index).to_string(),
+                                vec![osc::Type::Float(v)],
+                            ));
+                        })),
+                    }
+                })
+                .collect::<Vec<ArrayParams>>(),
         }
     }
 }
@@ -56,12 +75,13 @@ impl Plugin for SpaceRadio {
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const DEFAULT_INPUT_CHANNELS: u32 = 0;
-    const DEFAULT_OUTPUT_CHANNELS: u32 = 0;
+    const DEFAULT_OUTPUT_CHANNELS: u32 = 1;
 
     const DEFAULT_AUX_INPUTS: Option<AuxiliaryIOConfig> = None;
     const DEFAULT_AUX_OUTPUTS: Option<AuxiliaryIOConfig> = None;
 
-    const MIDI_INPUT: MidiConfig = MidiConfig::None;
+    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+    
     // Setting this to `true` will tell the wrapper to split the buffer up into smaller blocks
     // whenever there are inter-buffer parameter changes. This way no changes to the plugin are
     // required to support sample accurate automation and the wrapper handles all of the boring
@@ -78,15 +98,23 @@ impl Plugin for SpaceRadio {
         self.params.clone()
     }
 
-    fn accepts_bus_config(&self, config: &BusConfig) -> bool {
-        // This works with any symmetrical IO layout
-        config.num_input_channels == config.num_output_channels && config.num_input_channels > 0
-    }
+    // fn accepts_bus_config(&self, config: &BusConfig) -> bool {
+    //     // This works with any symmetrical IO layout
+    //     config.num_input_channels == config.num_output_channels && config.num_input_channels > 0
+    // }
 
     // This plugin doesn't need any special initialization, but if you need to do anything expensive
     // then this would be the place. State is kept around when the host reconfigures the
     // plugin. If we do need special initialization, we could implement the `initialize()` and/or
     // `reset()` methods
+    fn initialize(
+        &mut self,
+        _bus_config: &BusConfig,
+        _buffer_config: &BufferConfig,
+        _context: &mut impl InitContext<Self>,
+    ) -> bool {
+        true
+    }
 
     fn process(
         &mut self,
@@ -117,10 +145,8 @@ impl ClapPlugin for SpaceRadio {
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
-        ClapFeature::MultiEffects,
-        ClapFeature::Stereo,
-        ClapFeature::Mono,
         ClapFeature::Utility,
+        ClapFeature::Instrument,
     ];
 }
 
