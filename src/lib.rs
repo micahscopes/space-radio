@@ -1,9 +1,16 @@
+use dashmap::DashSet;
 use nannou_osc as osc;
 use nih_plug::prelude::*;
-use std::sync::Arc;
+use osc::Sender;
+use std::{
+    sync::{mpsc, Arc, Mutex, RwLock},
+    thread,
+};
 
 struct SpaceRadio {
     params: Arc<SpaceRadioParams>,
+    sender: Arc<Mutex<Option<Sender>>>,
+    dirty_params: Arc<DashSet<usize>>,
 }
 
 /// The [`Params`] derive macro gathers all of the information needed for the wrapper to know about
@@ -14,6 +21,10 @@ struct SpaceRadio {
 struct SpaceRadioParams {
     #[nested(array, group = "Array Parameters")]
     pub array_params: Vec<ArrayParams>,
+    #[persist = "osc_address"]
+    osc_destination_address: RwLock<String>,
+    #[persist = "osc_port"]
+    osc_destination_port: RwLock<u16>,
 }
 
 #[derive(Params)]
@@ -24,44 +35,72 @@ struct ArrayParams {
     pub val: FloatParam,
 }
 
-impl Default for SpaceRadio {
-    fn default() -> Self {
-        Self {
-            params: Arc::new(SpaceRadioParams::default()),
-        }
+impl SpaceRadio {
+    fn setup_sender(&mut self) {
+        let (tx_sender, rx_sender) = mpsc::channel();
+
+        thread::spawn(move || {
+            let sender = Arc::new(Mutex::new(Some(
+                osc::sender().expect("Could not bind to default socket"), // .connect(target_addr.clone())
+                                                                          // .expect("Could not connect to socket at address"),
+            )));
+
+            tx_sender.send(sender).unwrap();
+        });
+
+        let sender = rx_sender.recv().unwrap();
+        self.sender = sender;
     }
 }
 
-impl Default for SpaceRadioParams {
+impl Default for SpaceRadio {
     fn default() -> Self {
-        let port = 9009;
-        let target_addr = format!("{}:{}", "127.0.0.1", port);
+        let (tx_dirty_params, rx_dirty_params) = mpsc::channel();
+        thread::spawn(move || {
+            tx_dirty_params
+                .send(Arc::new(DashSet::<usize>::new()))
+                .unwrap();
+        });
+        let dirty_params = rx_dirty_params.recv().unwrap();
 
+        let mut space_radio = Self {
+            params: Arc::new(SpaceRadioParams::new(&dirty_params)),
+            sender: Arc::new(Mutex::new(None)),
+            dirty_params,
+        };
+
+        space_radio.setup_sender();
+        space_radio
+    }
+}
+
+impl SpaceRadioParams {
+    fn new(dirty_params: &Arc<DashSet<usize>>) -> Self {
         Self {
-            array_params: (1..65)
+            array_params: (0..64)
                 .map(|index| {
-                    let sender = osc::sender()
-                        .expect("Could not bind to default socket")
-                        .connect(target_addr.clone())
-                        .expect("Could not connect to socket at address");
-
+                    let dirty_params = Arc::clone(dirty_params);
                     ArrayParams {
                         val: FloatParam::new(
-                            format!("Ch. {index}"),
+                            format!("Ch. {index}", index = index + 1),
                             0.0,
                             FloatRange::Linear { min: 0.0, max: 1.0 },
                         )
-                        .with_callback(Arc::new(move |v| {
-                            sender.send((
-                                format!("/{}", index).to_string(),
-                                vec![osc::Type::Float(v)],
-                            ));
+                        .with_callback(Arc::new(move |_| {
+                            dirty_params.as_ref().insert(index);
                         })),
                     }
                 })
                 .collect::<Vec<ArrayParams>>(),
+            osc_destination_address: RwLock::new("127.0.0.1".into()),
+            osc_destination_port: RwLock::new(9009),
         }
     }
+}
+
+enum BackgroundTask {
+    UpdateParameter { index: usize, value: f32 },
+    // SetupSender,
 }
 
 impl Plugin for SpaceRadio {
@@ -81,7 +120,7 @@ impl Plugin for SpaceRadio {
     const DEFAULT_AUX_OUTPUTS: Option<AuxiliaryIOConfig> = None;
 
     const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
-    
+
     // Setting this to `true` will tell the wrapper to split the buffer up into smaller blocks
     // whenever there are inter-buffer parameter changes. This way no changes to the plugin are
     // required to support sample accurate automation and the wrapper handles all of the boring
@@ -92,7 +131,34 @@ impl Plugin for SpaceRadio {
     // More advanced plugins can use this to run expensive background tasks. See the field's
     // documentation for more information. `()` means that the plugin does not have any background
     // tasks.
-    type BackgroundTask = ();
+    type BackgroundTask = BackgroundTask;
+
+    fn task_executor(&self) -> TaskExecutor<Self> {
+        let sender = Arc::clone(&self.sender);
+        let port = *self.params.osc_destination_port.read().unwrap();
+        let osc_destination_address = self.params.osc_destination_address.read().unwrap().clone();
+
+        Box::new(move |task| match task {
+            BackgroundTask::UpdateParameter { index, value } => {
+                let sender = sender.lock().unwrap();
+                let target_addr = format!("{osc_destination_address}:{port}");
+
+                match sender.as_ref() {
+                    None => {
+                        // println!("No sender");
+                    }
+                    Some(sender) => {
+                        let addr = format!("/{index}").to_string();
+                        let value = vec![osc::Type::Float(value)];
+                        // println!("Sent {index} {value:?}");
+                        sender
+                            .send((addr, value), target_addr)
+                            .expect("Could not send message");
+                    }
+                }
+            }
+        })
+    }
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
@@ -120,16 +186,17 @@ impl Plugin for SpaceRadio {
         &mut self,
         _buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // for channel_samples in buffer.iter_samples() {
-        //     // Smoothing is optionally built into the parameters themselves
-        //     let gain = self.params.gain.smoothed.next();
+        for index in self.dirty_params.iter() {
+            let value = self.params.array_params[*index].val.value();
+            context.execute_background(BackgroundTask::UpdateParameter {
+                index: *index,
+                value,
+            });
+        }
 
-        //     for sample in channel_samples {
-        //         *sample *= gain;
-        //     }
-        // }
+        self.dirty_params.clear();
 
         ProcessStatus::Normal
     }
@@ -144,10 +211,7 @@ impl ClapPlugin for SpaceRadio {
     const CLAP_DESCRIPTION: Option<&'static str> = Some("OSC broadcaster");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
-        ClapFeature::Utility,
-        ClapFeature::Instrument,
-    ];
+    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::Utility, ClapFeature::Instrument];
 }
 
 impl Vst3Plugin for SpaceRadio {
